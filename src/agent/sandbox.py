@@ -20,7 +20,13 @@ class AgentSandbox:
         self._sandboxes: Dict[str, Path] = {}
 
     def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
-        sandbox_path = self.base_path / agent_id
+        if not agent_id or any(c in agent_id for c in ['/', '\\', '..']):
+            raise ValueError(f"Invalid agent_id: {agent_id}. Path traversal characters are not allowed.")
+            
+        sandbox_path = (self.base_path / agent_id).resolve()
+        if not str(sandbox_path).startswith(str(self.base_path.resolve())):
+            raise ValueError(f"Invalid agent_id: {agent_id}. Sandbox path is outside base directory.")
+            
         sandbox_path.mkdir(parents=True, exist_ok=True)
         self._sandboxes[agent_id] = sandbox_path
         return sandbox_path
