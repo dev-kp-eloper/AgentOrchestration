@@ -32,6 +32,21 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_resource_limits_validation(self):
+        from src.agent.sandbox import ResourceLimits
+        
+        with pytest.raises(ValueError, match="cpu_time must be positive numeric"):
+            ResourceLimits(cpu_time=-1)
+            
+        with pytest.raises(ValueError, match="memory_mb must be positive numeric"):
+            ResourceLimits(memory_mb=0)
+            
+        with pytest.raises(ValueError, match="disk_mb must be positive numeric"):
+            ResourceLimits(disk_mb=-100)
+            
+        with pytest.raises(ValueError, match="cpu_time must be positive numeric"):
+            ResourceLimits(cpu_time="invalid")
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update

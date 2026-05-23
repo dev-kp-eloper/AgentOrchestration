@@ -2,7 +2,10 @@
 
 import os
 import tempfile
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -12,6 +15,15 @@ class ResourceLimits:
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
+        self.validate()
+
+    def validate(self) -> None:
+        if not isinstance(self.cpu_time, (int, float)) or self.cpu_time <= 0:
+            raise ValueError(f"cpu_time must be positive numeric, got {self.cpu_time}")
+        if not isinstance(self.memory_mb, (int, float)) or self.memory_mb <= 0:
+            raise ValueError(f"memory_mb must be positive numeric, got {self.memory_mb}")
+        if not isinstance(self.disk_mb, (int, float)) or self.disk_mb <= 0:
+            raise ValueError(f"disk_mb must be positive numeric, got {self.disk_mb}")
 
 
 class AgentSandbox:
@@ -37,11 +49,13 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, getattr(resource, "error", Exception)) as e:
             pass
 
     def cleanup_all(self) -> None:
