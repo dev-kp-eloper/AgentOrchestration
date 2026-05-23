@@ -1,5 +1,10 @@
+import asyncio
+import logging
+from threading import Event, Thread
+
 import pytest
 from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.workflow import WorkflowManager
 
 
 class TestTaskScheduler:
@@ -12,7 +17,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +24,111 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_materializes_with_original_id(self):
+        task_id = self.scheduler.schedule({"type": "test"}, delay=0)
+
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["type"] == "test"
+
+    def test_removal_rejects_pending_and_new_runs_without_payload_log(
+        self,
+        caplog,
+    ):
+        manager = WorkflowManager(self.scheduler)
+        workflow = manager.create_workflow("nightly")
+        pending = {"workflow_id": workflow.id, "private": "not-for-logs"}
+        self.scheduler.enqueue(pending.copy())
+        self.scheduler.schedule(pending.copy(), delay=0)
+
+        with caplog.at_level(
+            logging.INFO,
+            logger="src.orchestrator.scheduler",
+        ):
+            assert manager.delete_workflow(workflow.id)
+            with pytest.raises(ValueError, match="deleted workflow"):
+                self.scheduler.enqueue(pending.copy())
+
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert "not-for-logs" not in caplog.text
+        decisions = [
+            item["decision"] for item in self.scheduler.audit_records()
+        ]
+        assert decisions == ["accepted", "rejected"]
+        assert self.scheduler.audit_records()[0]["purged_runs"] == 2
+
+    def test_removal_race_rejects_concurrent_run_creation(self):
+        entered_removal = Event()
+        release_removal = Event()
+        rejected = []
+        record = self.scheduler._record
+
+        def block_while_locked(*args):
+            if args[1] == "remove":
+                entered_removal.set()
+                assert release_removal.wait(timeout=1)
+            record(*args)
+
+        self.scheduler._record = block_while_locked
+
+        remover = Thread(target=self.scheduler.remove_workflow, args=("wf",))
+
+        def enqueue_after_removal_starts():
+            assert entered_removal.wait(timeout=1)
+            try:
+                self.scheduler.enqueue({"workflow_id": "wf"})
+            except ValueError:
+                rejected.append(True)
+
+        creator = Thread(target=enqueue_after_removal_starts)
+        remover.start()
+        creator.start()
+        assert entered_removal.wait(timeout=1)
+        release_removal.set()
+        remover.join(timeout=1)
+        creator.join(timeout=1)
+
+        assert not remover.is_alive()
+        assert not creator.is_alive()
+        assert rejected == [True]
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_in_flight_run_can_finish_but_cannot_retry_after_removal(self):
+        manager = WorkflowManager(self.scheduler)
+        workflow = manager.create_workflow("nightly")
+        complete_id = self.scheduler.enqueue({"workflow_id": workflow.id})
+        retry_id = self.scheduler.enqueue({"workflow_id": workflow.id})
+        assert asyncio.run(self.scheduler.dequeue())["id"] == complete_id
+        assert asyncio.run(self.scheduler.dequeue())["id"] == retry_id
+
+        assert manager.delete_workflow(workflow.id)
+        assert self.scheduler.complete(complete_id)
+        assert not self.scheduler.fail(retry_id)
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.audit_records()[-1]["action"] == "retry"
+
+    def test_removal_audit_is_bounded(self):
+        self.scheduler.remove_workflow("removed")
+
+        for _ in range(101):
+            with pytest.raises(ValueError):
+                self.scheduler.enqueue({"workflow_id": "removed"})
+
+        assert len(self.scheduler.audit_records()) == 100
 
 # 2019-01-09T19:07:03 update
 

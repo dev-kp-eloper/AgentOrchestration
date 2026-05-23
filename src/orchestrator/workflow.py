@@ -4,6 +4,8 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from src.orchestrator.scheduler import TaskScheduler
+
 
 class StepStatus(Enum):
     PENDING = "pending"
@@ -14,7 +16,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -44,8 +52,9 @@ class Workflow:
 
 
 class WorkflowManager:
-    def __init__(self):
+    def __init__(self, scheduler: Optional[TaskScheduler] = None):
         self._workflows: Dict[str, Workflow] = {}
+        self._scheduler = scheduler
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -59,7 +68,12 @@ class WorkflowManager:
         return list(self._workflows.values())
 
     def delete_workflow(self, workflow_id: str) -> bool:
-        return self._workflows.pop(workflow_id, None) is not None
+        if workflow_id not in self._workflows:
+            return False
+        if self._scheduler is not None:
+            self._scheduler.remove_workflow(workflow_id)
+        self._workflows.pop(workflow_id)
+        return True
 
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)

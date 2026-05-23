@@ -1,10 +1,14 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import logging
 import heapq
 import time
-from typing import Any, Dict, Optional
+from collections import deque
+from threading import Lock
+from typing import Any, Deque, Dict, List, Optional, Set
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -29,57 +33,182 @@ class PriorityQueue:
     def __len__(self) -> int:
         return len(self._queue)
 
+    def discard_workflow(self, workflow_id: str) -> int:
+        retained = [
+            entry
+            for entry in self._queue
+            if entry[2].get("workflow_id") != workflow_id
+        ]
+        removed = len(self._queue) - len(retained)
+        self._queue = retained
+        heapq.heapify(self._queue)
+        return removed
+
 
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._deleted_workflows: Set[str] = set()
+        self._audit: Deque[Dict[str, Any]] = deque(maxlen=100)
+        self._lock = Lock()
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            self._require_active_workflow(task, "enqueue")
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["enqueued_at"] = time.time()
+            task["retries"] = 0
 
+            self._push(task, queue, priority)
+            return task_id
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        with self._lock:
+            self._require_active_workflow(task, "schedule")
+            task_id = str(uuid4())
+            task["id"] = task_id
+            task["retries"] = 0
+            self._scheduled[task_id] = {
+                "task": task,
+                "due_at": time.time() + delay,
+                "queue": queue,
+                "priority": priority,
+            }
+            return task_id
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        with self._lock:
+            now = time.time()
+            expired = [
+                task_id
+                for task_id, record in self._scheduled.items()
+                if record["due_at"] <= now
+            ]
+            for task_id in expired:
+                record = self._scheduled.pop(task_id)
+                task = record["task"]
+                if self._is_deleted(task):
+                    self._reject(task, "materialize")
+                    continue
+                task["enqueued_at"] = now
+                self._push(task, record["queue"], record["priority"])
+
+            while queue in self._queues and len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if self._is_deleted(task):
+                    self._reject(task, "dispatch")
+                    continue
+                self._in_flight[task["id"]] = task
+                return task
+            return None
+
+    def complete(self, task_id: str) -> bool:
+        with self._lock:
+            return self._in_flight.pop(task_id, None) is not None
+
+    def fail(self, task_id: str, queue: str = "default") -> bool:
+        with self._lock:
+            task = self._in_flight.pop(task_id, None)
+            if not task:
+                return False
+            if self._is_deleted(task):
+                self._reject(task, "retry")
+                return False
+            task["retries"] += 1
+            if task["retries"] < self._max_retries:
+                self._push(task, queue, task.get("priority", 0))
+                return True
+            return False
+
+    def remove_workflow(self, workflow_id: str) -> bool:
+        with self._lock:
+            if workflow_id in self._deleted_workflows:
+                return False
+
+            self._deleted_workflows.add(workflow_id)
+            purged = sum(
+                pending.discard_workflow(workflow_id)
+                for pending in self._queues.values()
+            )
+            scheduled = [
+                task_id
+                for task_id, record in self._scheduled.items()
+                if record["task"].get("workflow_id") == workflow_id
+            ]
+            for task_id in scheduled:
+                self._scheduled.pop(task_id)
+            purged += len(scheduled)
+            self._record(workflow_id, "remove", "accepted", purged)
+            logger.info(
+                "Removed workflow from scheduler: workflow_id=%s "
+                "purged_runs=%s",
+                workflow_id,
+                purged,
+            )
+            return True
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [record.copy() for record in self._audit]
+
+    def _push(self, task: Dict, queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    def _is_deleted(self, task: Dict) -> bool:
+        return task.get("workflow_id") in self._deleted_workflows
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    def _require_active_workflow(self, task: Dict, action: str) -> None:
+        if self._is_deleted(task):
+            self._reject(task, action)
+            raise ValueError("cannot create a run for a deleted workflow")
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+    def _reject(self, task: Dict, action: str) -> None:
+        workflow_id = task.get("workflow_id")
+        self._record(workflow_id, action, "rejected", 0)
+        logger.warning(
+            "Rejected scheduler run transition: workflow_id=%s action=%s "
+            "reason=workflow_deleted",
+            workflow_id,
+            action,
+        )
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
-
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+    def _record(
+        self,
+        workflow_id: Optional[str],
+        action: str,
+        decision: str,
+        purged_runs: int,
+    ) -> None:
+        self._audit.append(
+            {
+                "workflow_id": workflow_id,
+                "action": action,
+                "decision": decision,
+                "reason": "workflow_deleted",
+                "purged_runs": purged_runs,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
