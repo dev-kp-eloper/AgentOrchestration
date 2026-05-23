@@ -31,6 +31,20 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_reset(self):
+        self.metrics.increment("requests.total")
+        self.metrics.gauge("memory.usage", 85.5)
+        self.metrics.observe("response.time", 0.5)
+        self.metrics.start_timer("operation")
+        
+        self.metrics.reset()
+        
+        snapshot = self.metrics.snapshot()
+        assert not snapshot["counters"]
+        assert not snapshot["gauges"]
+        assert not snapshot["histograms"]
+        assert not self.metrics._timers
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update
