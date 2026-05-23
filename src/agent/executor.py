@@ -2,8 +2,15 @@
 
 import asyncio
 import time
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
+
+_execution_id: ContextVar[Optional[str]] = ContextVar(
+    "execution_id",
+    default=None,
+)
+_agent_id: ContextVar[Optional[str]] = ContextVar("agent_id", default=None)
 
 
 class AgentExecutor:
@@ -13,7 +20,12 @@ class AgentExecutor:
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -23,27 +35,62 @@ class AgentExecutor:
             try:
                 result = await task_obj
                 self._results[execution_id] = result
+            except asyncio.CancelledError:
+                self._results[execution_id] = {
+                    "execution_id": execution_id,
+                    "agent_id": agent_id,
+                    "task_id": task.get("id"),
+                    "status": "cancelled",
+                    "timestamp": time.time(),
+                }
+                raise
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._results[execution_id] = {
+                    "execution_id": execution_id,
+                    "agent_id": agent_id,
+                    "task_id": task.get("id"),
+                    "status": "failed",
+                    "error": str(e),
+                    "timestamp": time.time(),
+                }
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
+        execution_token = _execution_id.set(exec_id)
+        agent_token = _agent_id.set(agent_id)
         start = time.time()
-        result = await handler(agent_id, task)
-        duration = time.time() - start
-        return {
-            "execution_id": exec_id,
-            "agent_id": agent_id,
-            "task_id": task.get("id"),
-            "result": result,
-            "duration": duration,
-            "timestamp": time.time(),
-        }
+        try:
+            result = await handler(agent_id, task)
+            duration = time.time() - start
+            return {
+                "execution_id": exec_id,
+                "agent_id": agent_id,
+                "task_id": task.get("id"),
+                "status": "completed",
+                "result": result,
+                "duration": duration,
+                "timestamp": time.time(),
+            }
+        finally:
+            _agent_id.reset(agent_token)
+            _execution_id.reset(execution_token)
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
+
+    def current_context(self) -> Dict[str, Optional[str]]:
+        return {
+            "execution_id": _execution_id.get(),
+            "agent_id": _agent_id.get(),
+        }
 
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
@@ -56,7 +103,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
