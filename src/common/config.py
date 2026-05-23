@@ -2,6 +2,7 @@
 
 import os
 import json
+import copy
 from typing import Any, Dict, Optional
 
 
@@ -30,7 +31,7 @@ class Config:
             if part not in current:
                 current[part] = {}
             current = current[part]
-        current[parts[-1]] = value
+        current[parts[-1]] = copy.deepcopy(value)
 
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
@@ -39,16 +40,16 @@ class Config:
             if isinstance(current, dict):
                 current = current.get(part)
                 if current is None:
-                    return default
+                    return copy.deepcopy(default)
             else:
-                return default
-        return current
+                return copy.deepcopy(default)
+        return copy.deepcopy(current)
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
     def to_dict(self) -> Dict:
-        return self._data
+        return copy.deepcopy(self._data)
 
 # 2019-03-14T15:29:32 update
 
