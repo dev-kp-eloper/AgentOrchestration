@@ -1,8 +1,17 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+from src.orchestrator.workflow_conditions import (
+    ConditionEvaluationError,
+    WorkflowCondition,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -14,12 +23,25 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        condition: Optional[WorkflowCondition] = None,
+    ):
+        if (
+            condition is not None
+            and not isinstance(condition, WorkflowCondition)
+        ):
+            raise TypeError("condition must be a WorkflowCondition instance")
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.condition = condition
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -61,13 +83,28 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
-    def execute_workflow(self, workflow_id: str) -> bool:
+    def execute_workflow(
+        self,
+        workflow_id: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
+        decisions = self._bind_conditions(
+            workflow,
+            {} if context is None else context,
+        )
+        if decisions is None:
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
+            if not decisions[step.id]:
+                step.status = StepStatus.SKIPPED
+                continue
+
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
@@ -81,6 +118,49 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _bind_conditions(
+        self,
+        workflow: Workflow,
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, bool]]:
+        decisions: Dict[str, bool] = {}
+        for step in workflow.steps:
+            condition = step.condition
+            if condition is None:
+                decisions[step.id] = True
+                continue
+
+            if not isinstance(condition, WorkflowCondition):
+                self._reject_condition(
+                    workflow,
+                    step,
+                    "invalid condition binding",
+                )
+                return None
+
+            try:
+                decisions[step.id] = condition.evaluate(context)
+            except ConditionEvaluationError as exc:
+                self._reject_condition(workflow, step, str(exc))
+                return None
+
+        return decisions
+
+    def _reject_condition(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+        reason: str,
+    ) -> None:
+        metrics.increment("workflow.condition.rejected")
+        logger.warning(
+            "Rejected workflow condition before dispatch: "
+            "workflow_id=%s step_id=%s reason=%s",
+            workflow.id,
+            step.id,
+            reason,
+        )
 
 # 2019-03-27T19:58:07 update
 
