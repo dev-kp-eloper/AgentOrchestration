@@ -7,11 +7,19 @@ from uuid import uuid4
 
 
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(self, max_concurrent: int = 5, max_results: int = 1000):
         self.max_concurrent = max_concurrent
+        self.max_results = max_results
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+
+    def _store_result(self, execution_id: str, result: Any) -> None:
+        self._results[execution_id] = result
+        if len(self._results) > self.max_results:
+            # dict retains insertion order in python 3.7+
+            oldest_key = next(iter(self._results))
+            del self._results[oldest_key]
 
     async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
         execution_id = str(uuid4())
@@ -22,9 +30,9 @@ class AgentExecutor:
             self._active_tasks[execution_id] = task_obj
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._store_result(execution_id, result)
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._store_result(execution_id, {"error": str(e)})
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
