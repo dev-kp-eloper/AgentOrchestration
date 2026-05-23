@@ -41,7 +41,9 @@ class AgentSandbox:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+            disk_bytes = limits.disk_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_FSIZE, (disk_bytes, disk_bytes))
+        except (ValueError, getattr(resource, "error", Exception)) as e:
             pass
 
     def cleanup_all(self) -> None:
