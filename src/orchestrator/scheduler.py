@@ -38,21 +38,24 @@ class TaskScheduler:
         self._max_retries = 3
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
+        task = task.copy()
+        if "id" not in task:
+            task["id"] = str(uuid4())
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        if "retries" not in task:
+            task["retries"] = 0
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
+        return task["id"]
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+        task = task.copy()
+        if "id" not in task:
+            task["id"] = str(uuid4())
+        self._scheduled[task["id"]] = time.time() + delay
+        return task["id"]
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
         now = time.time()
@@ -75,6 +78,7 @@ class TaskScheduler:
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
+            task = task.copy()
             task["retries"] += 1
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
