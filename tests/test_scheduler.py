@@ -36,6 +36,29 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_transient_store_failure_defers_transition(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        self.scheduler.mark_lease_store_error(task_id)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is None  # Transition deferred because lease is in store error state
+
+    def test_lease_recovery_via_renewal(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        self.scheduler.mark_lease_store_error(task_id)
+        # Recover lease
+        assert self.scheduler.renew_lease(task_id, lease_epoch=1)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["id"] == task_id
+
+    def test_stale_lease_renewal_rejected(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        # Attempt renewal with invalid/stale epoch
+        assert not self.scheduler.renew_lease(task_id, lease_epoch=999)
+
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

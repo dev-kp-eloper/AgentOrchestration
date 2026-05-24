@@ -2,9 +2,12 @@
 
 import asyncio
 import heapq
+import logging
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -33,53 +36,215 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._leases: Dict[str, Dict] = {}
+        self._audit_log = []
         self._max_retries = 3
+        self._lease_timeout = 30
+
+    def _record_audit(self, event: str, task_id: str, reason: str) -> None:
+        self._audit_log.append(
+            {
+                "event": event,
+                "task_id": task_id,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+        )
+
+        # bounded metadata retention
+        if len(self._audit_log) > 1000:
+            self._audit_log = self._audit_log[-1000:]
+
+        logger.warning(
+            "scheduler_audit event=%s task_id=%s reason=%s",
+            event,
+            task_id,
+            reason,
+        )
+
+    def _create_lease(self, task_id: str) -> Dict:
+        lease = {
+            "lease_epoch": 1,
+            "expires_at": time.time() + self._lease_timeout,
+            "store_error": False,
+            "transition_blocked": False,
+        }
+        self._leases[task_id] = lease
+        return lease
+
+    def mark_lease_store_error(self, task_id: str) -> None:
+        lease = self._leases.get(task_id)
+        if lease:
+            lease["store_error"] = True
+            lease["transition_blocked"] = True
+            self._record_audit(
+                "lease_store_error",
+                task_id,
+                "transient_store_failure_detected",
+            )
+
+    def renew_lease(self, task_id: str, lease_epoch: int) -> bool:
+        lease = self._leases.get(task_id)
+        if not lease:
+            return False
+
+        # stale renewals are rejected atomically
+        if lease_epoch != lease["lease_epoch"]:
+            self._record_audit(
+                "lease_rejected",
+                task_id,
+                "stale_lease_epoch",
+            )
+            return False
+
+        lease["expires_at"] = time.time() + self._lease_timeout
+        lease["store_error"] = False
+        lease["transition_blocked"] = False
+        lease["lease_epoch"] += 1
+
+        self._record_audit(
+            "lease_resumed",
+            task_id,
+            "lease_successfully_recovered",
+        )
+        return True
+
+    def _validate_transition(self, task_id: str) -> bool:
+        lease = self._leases.get(task_id)
+        if not lease:
+            return False
+
+        if lease["transition_blocked"]:
+            self._record_audit(
+                "transition_deferred",
+                task_id,
+                "lease_in_invalid_state",
+            )
+            return False
+
+        if lease["expires_at"] < time.time():
+            self._record_audit(
+                "transition_rejected",
+                task_id,
+                "lease_expired",
+            )
+            return False
+
+        return True
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority"] = priority
+
+        self._create_lease(task_id)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["priority"] = priority
+        task["retries"] = 0
+        task["queue"] = queue
+
+        self._create_lease(task_id)
+
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": time.time() + delay,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, data in self._scheduled.items()
+            if data["run_at"] <= now
+        ]
+
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            task = scheduled["task"]
+
+            if not self._validate_transition(tid):
+                self._scheduled[tid] = {
+                    "task": task,
+                    "run_at": now + 1,
+                }
+                continue
+
+            self.enqueue(
+                task,
+                queue=task.get("queue", queue),
+                priority=task.get("priority", 0),
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                if not self._validate_transition(task["id"]):
+                    self._queues[queue].push(
+                        task,
+                        task.get("priority", 0),
+                    )
+                    return None
+
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
+        if not self._validate_transition(task_id):
+            return False
+        self._leases.pop(task_id, None)
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
+        if not self._validate_transition(task_id):
+            return False
+
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self.enqueue(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
+                self._record_audit(
+                    "task_retry",
+                    task_id,
+                    "retry_scheduled",
+                )
                 return True
+
+            self._record_audit(
+                "task_failed",
+                task_id,
+                "retry_limit_exceeded",
+            )
         return False
+
 
 # 2019-04-25T08:37:12 update
 
