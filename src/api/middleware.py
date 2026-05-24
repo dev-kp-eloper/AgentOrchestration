@@ -11,11 +11,30 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        # Declarative boundary: Machine tokens are not allowed to perform destructive actions
+        self.machine_forbidden_methods = {"DELETE"}
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
+            
+            token = auth_header[7:]
+            if token.startswith("ao_machine_"):
+                token_type = "machine"
+            elif token.startswith("ao_user_"):
+                token_type = "user"
+            else:
+                return Response(status_code=403, content="Forbidden: Invalid token prefix")
+                
+            request.state.token_type = token_type
+            
+            if token_type == "machine" and request.method in self.machine_forbidden_methods:
+                return Response(status_code=403, content="Forbidden: Action not allowed for machine tokens")
+                
         return await call_next(request)
 
 
