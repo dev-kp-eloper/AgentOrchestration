@@ -113,6 +113,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+import asyncio
 from uuid import uuid4
 from src.common.logging import request_id_var
 
@@ -121,55 +122,48 @@ class ContextPropagatingBackgroundTask:
         self.background_task = background_task
         self.request_id = request_id
 
-    async def __call__(self) -> None:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         token = request_id_var.set(self.request_id)
         try:
-            await self.background_task()
+            res = self.background_task(*args, **kwargs)
+            if asyncio.iscoroutine(res):
+                async def wrapper():
+                    inner_token = request_id_var.set(self.request_id)
+                    try:
+                        return await res
+                    finally:
+                        request_id_var.reset(inner_token)
+                return wrapper()
+            return res
         finally:
             request_id_var.reset(token)
 
 
-class LoggingMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        from starlette.datastructures import Headers
-        headers = Headers(scope=scope)
-        request_id = headers.get("X-Request-ID") or str(uuid4())
-        
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        request_id = request.headers.get("X-Request-ID") or str(uuid4())
         token = request_id_var.set(request_id)
         
-        # Access the Starlette Request state if possible to store request_id
-        # We can construct a Request object to populate state
-        request = Request(scope, receive)
         request.state.request_id = request_id
         
         start_time = time.time()
-        status_code = [200]
-        
-        async def send_wrapper(message):
-            if message["type"] == "http.response.start":
-                status_code[0] = message.get("status", 200)
-                headers_list = message.setdefault("headers", [])
-                has_req_id = False
-                for k, v in headers_list:
-                    if k.lower() == b"x-request-id":
-                        has_req_id = True
-                        break
-                if not has_req_id:
-                    headers_list.append((b"x-request-id", request_id.encode("latin-1")))
-            await send(message)
-
         try:
-            await self.app(scope, receive, send_wrapper)
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            
+            # Wrap background tasks to propagate request_id context
+            if response.background:
+                if hasattr(response.background, "tasks"):
+                    for task in response.background.tasks:
+                        task.func = ContextPropagatingBackgroundTask(task.func, request_id)
+                else:
+                    response.background.func = ContextPropagatingBackgroundTask(response.background.func, request_id)
+            
+            return response
         finally:
             duration = time.time() - start_time
-            logger.info(f"{scope['method']} {scope['path']} {status_code[0]} {duration:.3f}s")
+            status_code = response.status_code if 'response' in locals() else 500
+            logger.info(f"{request.method} {request.url.path} {status_code} {duration:.3f}s")
             request_id_var.reset(token)
             if hasattr(request.state, "request_id"):
                 delattr(request.state, "request_id")
