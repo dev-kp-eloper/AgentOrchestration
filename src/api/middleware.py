@@ -1,13 +1,87 @@
 """API middleware components."""
 
+import os
 import time
 import logging
-from typing import Callable
+from typing import Callable, List, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
+
+
+def _load_cors_allowlist() -> List[str]:
+    """Load CORS allowlist from AO_CORS_ALLOWLIST env var (comma-separated origins)."""
+    raw = os.environ.get("AO_CORS_ALLOWLIST", "")
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+class CORSMiddleware(BaseHTTPMiddleware):
+    """Enforce CORS allowlist on credentialed cross-origin requests.
+
+    Per the CORS spec, ``Access-Control-Allow-Credentials: true`` must NEVER
+    be paired with a wildcard origin.  This middleware validates every request
+    that carries an ``Origin`` header against a configurable allowlist *before*
+    any application logic runs, making the check fail-closed.
+
+    Decision logic
+    --------------
+    1. No ``Origin`` header -> same-origin request; pass through.
+    2. ``Origin`` in allowlist -> allowed; attach CORS response headers.
+    3. ``Origin`` NOT in allowlist -> 403 Forbidden; log the violation.
+    4. ``OPTIONS`` pre-flight -> same allowlist check, then 204 No Content.
+    """
+
+    def __init__(self, app, allowlist: Optional[List[str]] = None,
+                 allow_credentials: bool = True):
+        super().__init__(app)
+        self.allowlist: List[str] = allowlist if allowlist is not None else _load_cors_allowlist()
+        self.allow_credentials = allow_credentials
+
+    def _origin_allowed(self, origin: str) -> bool:
+        return origin.rstrip("/") in self.allowlist
+
+    def _cors_headers(self, origin: str) -> dict:
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Request-ID",
+            "Access-Control-Max-Age": "600",
+            "Vary": "Origin",
+        }
+        if self.allow_credentials:
+            headers["Access-Control-Allow-Credentials"] = "true"
+        return headers
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        origin: str = request.headers.get("Origin", "")
+
+        # Same-origin or non-browser request — pass through without CORS headers.
+        if not origin:
+            return await call_next(request)
+
+        if not self._origin_allowed(origin):
+            logger.warning(
+                "CORS blocked: origin=%r path=%s method=%s",
+                origin, request.url.path, request.method,
+            )
+            return Response(
+                status_code=403,
+                content="Forbidden: origin not in CORS allowlist",
+                headers={"Vary": "Origin"},
+            )
+
+        cors_headers = self._cors_headers(origin)
+
+        # Handle OPTIONS pre-flight without hitting the application.
+        if request.method == "OPTIONS":
+            return Response(status_code=204, headers=cors_headers)
+
+        response = await call_next(request)
+        for key, value in cors_headers.items():
+            response.headers[key] = value
+        return response
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -64,17 +138,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     return Response(status_code=403, content="Forbidden: Invalid token prefix")
                     
                 # Enforce CORS allowlist on credentialed requests — browser clients
+                # CORSMiddleware handles this for all requests; this is a belt-and-suspenders
+                # check specific to browser token users so it still fails-closed
+                # even if CORSMiddleware is misconfigured or bypassed.
                 if token_type == "browser":
-                    origin = request.headers.get("Origin")
+                    origin = request.headers.get("Origin", "")
                     if not origin:
                         return Response(status_code=400, content="Bad Request: Missing Origin header for browser client")
-                    
-                    import os
-                    cors_origins_env = os.getenv("CORS_ORIGINS", "")
-                    allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip() and o.strip() != "*"]
-                    
-                    if origin not in allowed_origins:
-                        return Response(status_code=400, content="Bad Request: Origin not in CORS allowlist")
+                    allowed_origins = _load_cors_allowlist()
+                    if origin.rstrip("/") not in allowed_origins:
+                        logger.warning("Auth blocked browser token from disallowed origin=%r", origin)
+                        return Response(status_code=403, content="Forbidden: Origin not in CORS allowlist")
                 
                 request.state.token_type = token_type
                 has_state = True
