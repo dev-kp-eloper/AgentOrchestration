@@ -5,6 +5,8 @@ import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
+from src.runtime.result_guard import ResultRuntimeGuard
+
 
 class AgentExecutor:
     def __init__(self, max_concurrent: int = 5):
@@ -12,6 +14,7 @@ class AgentExecutor:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self.guard = ResultRuntimeGuard()
 
     async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
         execution_id = str(uuid4())
@@ -31,16 +34,23 @@ class AgentExecutor:
 
     async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
         start = time.time()
-        result = await handler(agent_id, task)
-        duration = time.time() - start
-        return {
-            "execution_id": exec_id,
-            "agent_id": agent_id,
-            "task_id": task.get("id"),
-            "result": result,
-            "duration": duration,
-            "timestamp": time.time(),
-        }
+        self.guard.initialize(exec_id)
+        try:
+            result = await handler(agent_id, task)
+            # Validate JSON serialization and complete run atomically before returning
+            self.guard.complete_run(exec_id, result)
+            duration = time.time() - start
+            return {
+                "execution_id": exec_id,
+                "agent_id": agent_id,
+                "task_id": task.get("id"),
+                "result": result,
+                "duration": duration,
+                "timestamp": time.time(),
+            }
+        except Exception as exc:
+            self.guard.fail_run(exec_id, str(exc))
+            raise
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
