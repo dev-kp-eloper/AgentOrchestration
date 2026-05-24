@@ -3,8 +3,22 @@
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
+from .protocol import (
+    WorkerProtocolSettings,
+    WorkerProtocolValidator,
+    ProtocolValidationError,
+    create_validator_with_defaults,
+)
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "WorkflowManager",
+    "WorkerProtocolSettings",
+    "WorkerProtocolValidator",
+    "ProtocolValidationError",
+    "create_validator_with_defaults",
+]
 
 # 2019-07-01T16:04:27 update
 
