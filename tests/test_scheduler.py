@@ -36,6 +36,45 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_schedule_and_dequeue_expiration(self):
+        import asyncio
+        task_id = self.scheduler.schedule({"type": "scheduled_task", "data": "yes"}, delay=-1)
+        # Dequeue should trigger expiration processing
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["type"] == "scheduled_task"
+        assert task["data"] == "yes"
+
+    def test_delete_run_purges_scheduled(self):
+        task_id = self.scheduler.schedule({"type": "task1", "run_id": "run-abc"}, delay=10)
+        self.scheduler.delete_run("run-abc")
+        assert task_id not in self.scheduler._scheduled
+        assert task_id not in self.scheduler._scheduled_times
+
+    def test_delete_run_purges_queued(self):
+        import asyncio
+        self.scheduler.enqueue({"type": "task2", "run_id": "run-xyz"})
+        self.scheduler.delete_run("run-xyz")
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is None
+
+    def test_delete_run_rejects_new_work(self):
+        self.scheduler.delete_run("run-deleted")
+        task_id_enqueue = self.scheduler.enqueue({"type": "task", "run_id": "run-deleted"})
+        task_id_schedule = self.scheduler.schedule({"type": "task", "run_id": "run-deleted"}, delay=10)
+        assert task_id_enqueue == ""
+        assert task_id_schedule == ""
+
+    def test_delete_run_cleans_inflight(self):
+        import asyncio
+        self.scheduler.enqueue({"type": "task3", "run_id": "run-123"})
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["id"] in self.scheduler._in_flight
+        
+        self.scheduler.delete_run("run-123")
+        assert task["id"] not in self.scheduler._in_flight
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

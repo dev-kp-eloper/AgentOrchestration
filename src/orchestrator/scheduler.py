@@ -33,15 +33,21 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
+        self._scheduled_times: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._deleted_runs = set()
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+        run_id = task.get("workflow_id") or task.get("run_id")
+        if run_id and run_id in self._deleted_runs:
+            return ""
+
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["retries"] = task.get("retries", 0)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
@@ -49,24 +55,39 @@ class TaskScheduler:
         return task_id
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+        run_id = task.get("workflow_id") or task.get("run_id")
+        if run_id and run_id in self._deleted_runs:
+            return ""
+
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["queue"] = queue
+        task["priority"] = priority
+        
+        self._scheduled[task_id] = task
+        self._scheduled_times[task_id] = time.time() + delay
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [tid for tid, t in self._scheduled_times.items() if t <= now]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            self._scheduled_times.pop(tid, None)
+            task = self._scheduled.pop(tid, None)
             if task:
-                self.enqueue(task, queue)
+                run_id = task.get("workflow_id") or task.get("run_id")
+                if not (run_id and run_id in self._deleted_runs):
+                    self.enqueue(task, queue, priority=task.get("priority", 0))
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
+            while len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if task:
+                    run_id = task.get("workflow_id") or task.get("run_id")
+                    if run_id and run_id in self._deleted_runs:
+                        continue
+                    self._in_flight[task["id"]] = task
+                    return task
         return None
 
     def complete(self, task_id: str) -> bool:
@@ -80,6 +101,36 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def delete_run(self, run_id: str) -> None:
+        """Mark a run/workflow as deleted and clean up any scheduled or queued tasks associated with it."""
+        self._deleted_runs.add(run_id)
+        
+        # 1. Clean up scheduled tasks
+        to_remove = []
+        for tid, task in self._scheduled.items():
+            if task.get("workflow_id") == run_id or task.get("run_id") == run_id:
+                to_remove.append(tid)
+        for tid in to_remove:
+            self._scheduled.pop(tid, None)
+            self._scheduled_times.pop(tid, None)
+            
+        # 2. Clean up queued tasks
+        import heapq
+        for queue_name, prio_queue in self._queues.items():
+            prio_queue._queue = [
+                item for item in prio_queue._queue 
+                if not (item[2].get("workflow_id") == run_id or item[2].get("run_id") == run_id)
+            ]
+            heapq.heapify(prio_queue._queue)
+            
+        # 3. Clean up in-flight tasks
+        to_remove_inflight = [
+            tid for tid, task in self._in_flight.items()
+            if task.get("workflow_id") == run_id or task.get("run_id") == run_id
+        ]
+        for tid in to_remove_inflight:
+            self._in_flight.pop(tid, None)
 
 # 2019-04-25T08:37:12 update
 
