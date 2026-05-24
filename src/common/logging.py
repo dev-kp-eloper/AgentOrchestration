@@ -5,6 +5,17 @@ import logging
 import sys
 from datetime import datetime
 from typing import Dict, Optional
+import contextvars
+
+request_id_var = contextvars.ContextVar("request_id", default=None)
+
+
+class RequestIDFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = request_id_var.get()
+        if request_id:
+            record.request_id = request_id
+        return True
 
 
 class StructuredFormatter(logging.Formatter):
@@ -24,11 +35,15 @@ class StructuredFormatter(logging.Formatter):
 
 def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
     handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(RequestIDFilter())
     if json_output:
         handler.setFormatter(StructuredFormatter())
     else:
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), handlers=[handler])
+    
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root.handlers = [handler]
 
 # 2019-01-14T10:37:21 update
 
