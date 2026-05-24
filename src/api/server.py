@@ -30,9 +30,9 @@ def create_app(config: Dict = None) -> FastAPI:
 
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
 
-    app.add_middleware(AuthMiddleware)
-    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(LoggingMiddleware)
+    app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(AuthMiddleware)
 
     app.include_router(router, prefix="/api/v2")
 

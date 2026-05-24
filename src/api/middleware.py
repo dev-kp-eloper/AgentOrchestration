@@ -7,16 +7,61 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+import os
+import re
+import posixpath
+
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+        # Bypass OPTIONS requests (CORS preflight)
+        if request.method == "OPTIONS":
+            try:
+                return await call_next(request)
+            finally:
+                if hasattr(request, "state"):
+                    request.state.__dict__.clear()
+
+        # Collapse duplicate slashes and normalize path
+        raw_path = request.url.path
+        normalized_path = posixpath.normpath(re.sub(r"/+", "/", raw_path))
+        if normalized_path != "/" and normalized_path.endswith("/"):
+            normalized_path = normalized_path.rstrip("/")
+
+        # Check CORS allowlist on credentialed requests from browser clients
+        origin = request.headers.get("Origin")
+        if origin:
+            is_credentialed = "Authorization" in request.headers or "Cookie" in request.headers
+            if is_credentialed:
+                # Read allowed origins from CORS_ORIGINS
+                cors_origins_env = os.getenv("CORS_ORIGINS", "")
+                allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+                # If CORS_ORIGINS is empty, or contains only "*", or origin is not in the list: reject!
+                if not allowed_origins or "*" in allowed_origins or origin not in allowed_origins:
+                    logger.warning(
+                        f"CORS request rejected: Origin '{origin}' is not allowed for credentialed requests."
+                    )
+                    return Response(
+                        status_code=400,
+                        content="CORS request from origin not allowed for credentialed requests"
+                    )
+
+        # Authenticate /api/v2 requests
+        if normalized_path.startswith("/api/v2") and normalized_path != "/api/v2/auth/token":
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
+                logger.warning(f"Unauthenticated request to {normalized_path}")
                 return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            if hasattr(request, "state"):
+                request.state.__dict__.clear()
+
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
