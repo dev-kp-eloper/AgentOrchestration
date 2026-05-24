@@ -2,16 +2,106 @@
 
 import os
 import tempfile
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
+from enum import Enum
 from typing import Dict, Optional
 from pathlib import Path
 
 
+class ResourceValidationError(ValueError):
+    """Raised when resource requests fall below workload-class minimums."""
+    pass
+
+
+class WorkerClass(str, Enum):
+    """Workload classes with documented minimum resource requirements.
+
+    Minimums per class
+    ------------------
+    LIGHTWEIGHT : cpu_time >= 10 s,  memory_mb >=  64 MB,  disk_mb >=  50 MB
+    STANDARD    : cpu_time >= 30 s,  memory_mb >= 256 MB,  disk_mb >= 100 MB
+    HEAVY       : cpu_time >= 60 s,  memory_mb >= 512 MB,  disk_mb >= 200 MB
+    """
+    LIGHTWEIGHT = "lightweight"
+    STANDARD = "standard"
+    HEAVY = "heavy"
+
+
+# Per-class minimums: cpu_time (s), memory_mb, disk_mb
+_CLASS_MINIMUMS: Dict[str, Dict[str, int]] = {
+    WorkerClass.LIGHTWEIGHT: {"cpu_time": 10,  "memory_mb":  64, "disk_mb":  50},
+    WorkerClass.STANDARD:    {"cpu_time": 30,  "memory_mb": 256, "disk_mb": 100},
+    WorkerClass.HEAVY:       {"cpu_time": 60,  "memory_mb": 512, "disk_mb": 200},
+}
+
+
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+    """Resource limits for a worker, validated against workload-class minimums.
+
+    Parameters
+    ----------
+    cpu_time:     Maximum CPU seconds the worker may consume.
+    memory_mb:    Maximum resident memory in mebibytes.
+    disk_mb:      Maximum temporary-disk usage in mebibytes.
+    worker_class: Workload class that determines minimum acceptable values.
+                  Pass ``None`` to skip class-based validation (not recommended
+                  for production deployments).
+
+    Raises
+    ------
+    ResourceValidationError
+        If any requested value is non-positive or below the class minimum.
+    """
+
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+        worker_class: Optional[WorkerClass] = WorkerClass.STANDARD,
+    ):
+        errors = []
+        # Positive value guards
+        if not isinstance(cpu_time, int) or cpu_time <= 0:
+            errors.append(f"cpu_time must be a positive integer, got {cpu_time!r}")
+        if not isinstance(memory_mb, int) or memory_mb <= 0:
+            errors.append(f"memory_mb must be a positive integer, got {memory_mb!r}")
+        if not isinstance(disk_mb, int) or disk_mb <= 0:
+            errors.append(f"disk_mb must be a positive integer, got {disk_mb!r}")
+        if errors:
+            raise ResourceValidationError("; ".join(errors))
+
+        # Workload-class minimum enforcement
+        if worker_class is not None:
+            mins = _CLASS_MINIMUMS[worker_class]
+            if cpu_time < mins["cpu_time"]:
+                errors.append(
+                    f"cpu_time={cpu_time}s is below {worker_class.value!r} minimum "
+                    f"of {mins['cpu_time']}s"
+                )
+            if memory_mb < mins["memory_mb"]:
+                errors.append(
+                    f"memory_mb={memory_mb} is below {worker_class.value!r} minimum "
+                    f"of {mins['memory_mb']} MB"
+                )
+            if disk_mb < mins["disk_mb"]:
+                errors.append(
+                    f"disk_mb={disk_mb} is below {worker_class.value!r} minimum "
+                    f"of {mins['disk_mb']} MB"
+                )
+            if errors:
+                raise ResourceValidationError(
+                    f"Worker resource requests rejected "
+                    f"(class={worker_class.value!r}): " + "; ".join(errors)
+                )
+
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
+        self.worker_class = worker_class
 
 
 class AgentSandbox:
@@ -37,153 +127,15 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, Exception):
             pass
 
     def cleanup_all(self) -> None:
         for agent_id in list(self._sandboxes.keys()):
             self.destroy(agent_id)
-
-# 2019-01-10T19:56:24 update
-
-# 2019-02-07T17:00:55 update
-
-# 2019-05-15T17:22:36 update
-
-# 2019-06-14T10:08:48 update
-
-# 2019-06-21T11:59:12 update
-
-# 2019-06-26T13:24:25 update
-
-# 2019-07-05T09:17:12 update
-
-# 2019-07-09T11:23:07 update
-
-# 2019-07-10T16:17:07 update
-
-# 2019-08-15T10:32:06 update
-
-# 2019-08-18T17:28:35 update
-
-# 2019-10-15T13:00:49 update
-
-# 2019-10-25T10:56:15 update
-
-# 2020-01-10T10:39:46 update
-
-# 2020-01-27T13:05:12 update
-
-# 2020-04-16T14:16:09 update
-
-# 2020-05-20T14:43:03 update
-
-# 2020-06-16T20:48:15 update
-
-# 2020-07-03T20:44:23 update
-
-# 2020-07-13T20:07:35 update
-
-# 2020-07-16T14:18:50 update
-
-# 2020-08-04T18:59:59 update
-
-# 2020-08-31T11:47:49 update
-
-# 2020-09-07T16:04:09 update
-
-# 2020-10-27T16:57:05 update
-
-# 2021-02-09T15:01:25 update
-
-# 2021-03-25T08:24:03 update
-
-# 2021-06-16T13:38:08 update
-
-# 2021-06-29T08:07:27 update
-
-# 2021-08-13T12:17:43 update
-
-# 2021-09-01T17:41:43 update
-
-# 2021-09-08T10:52:46 update
-
-# 2021-10-19T13:52:01 update
-
-# 2021-12-02T14:43:57 update
-
-# 2021-12-05T11:58:00 update
-
-# 2021-12-06T16:06:43 update
-
-# 2022-01-10T10:07:26 update
-
-# 2022-05-09T11:02:27 update
-
-# 2022-05-24T15:22:51 update
-
-# 2022-06-07T14:26:19 update
-
-# 2022-06-14T16:38:30 update
-
-# 2022-06-20T08:51:21 update
-
-# 2022-09-20T19:47:42 update
-
-# 2022-10-13T11:17:25 update
-
-# 2022-11-24T15:00:47 update
-
-# 2022-12-30T10:34:09 update
-
-# 2023-02-20T18:28:14 update
-
-# 2023-05-18T10:27:39 update
-
-# 2023-06-05T10:20:59 update
-
-# 2023-08-18T19:57:46 update
-
-# 2023-11-10T10:56:24 update
-
-# 2023-11-24T18:44:27 update
-
-# 2024-03-24T16:18:35 update
-
-# 2024-05-24T12:13:29 update
-
-# 2024-08-14T11:04:54 update
-
-# 2024-08-30T09:24:53 update
-
-# 2024-09-19T12:07:20 update
-
-# 2025-01-21T10:05:40 update
-
-# 2025-03-26T08:29:32 update
-
-# 2025-04-01T19:54:56 update
-
-# 2025-05-01T19:15:22 update
-
-# 2025-06-18T09:43:12 update
-
-# 2025-07-01T16:44:03 update
-
-# 2025-07-02T09:21:55 update
-
-# 2025-08-20T15:20:10 update
-
-# 2026-01-09T10:50:15 update
-
-# 2026-02-09T12:46:51 update
-
-# 2026-02-16T14:16:15 update
-
-# 2026-03-10T10:16:37 update
-
-# 2026-05-18T12:52:56 update
