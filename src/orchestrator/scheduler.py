@@ -7,12 +7,20 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 
+class CapacityError(Exception):
+    """Exception raised when queue capacity is exceeded."""
+    pass
+
+
 class PriorityQueue:
-    def __init__(self):
+    def __init__(self, maxsize: int = 0):
         self._queue = []
         self._counter = 0
+        self.maxsize = maxsize
 
     def push(self, item: Any, priority: int = 0) -> None:
+        if self.maxsize > 0 and len(self._queue) >= self.maxsize:
+            raise CapacityError("Queue capacity limit exceeded")
         heapq.heappush(self._queue, (-priority, self._counter, item))
         self._counter += 1
 
@@ -26,27 +34,58 @@ class PriorityQueue:
             return self._queue[0][2]
         return None
 
+    def remove(self, task_id: str) -> bool:
+        for idx, (_, _, item) in enumerate(self._queue):
+            if isinstance(item, dict) and item.get("id") == task_id:
+                self._queue.pop(idx)
+                heapq.heapify(self._queue)
+                return True
+        return False
+
     def __len__(self) -> int:
         return len(self._queue)
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, default_max_queue_size: int = 1000):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self.default_max_queue_size = default_max_queue_size
+        self._enqueuing = set()
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["retries"] = task.get("retries", 0)
 
         if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+            self._queues[queue] = PriorityQueue(maxsize=self.default_max_queue_size)
+        
+        self._enqueuing.add(task_id)
+        try:
+            self._queues[queue].push(task, priority)
+        except CapacityError:
+            self._enqueuing.discard(task_id)
+            raise
         return task_id
+
+    def enqueue_rollback(self, task_id: str, queue: str = "default") -> bool:
+        if task_id in self._enqueuing:
+            self._enqueuing.discard(task_id)
+            if queue in self._queues:
+                return self._queues[queue].remove(task_id)
+        return False
+
+    def queue_size(self, queue: str = "default") -> int:
+        if queue in self._queues:
+            return len(self._queues[queue])
+        return 0
+
+    def in_flight_count(self) -> int:
+        return len(self._in_flight)
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -59,17 +98,23 @@ class TaskScheduler:
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            if task and isinstance(task, dict):
+                try:
+                    self.enqueue(task, queue)
+                except CapacityError:
+                    pass
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
-                self._in_flight[task["id"]] = task
+                tid = task["id"]
+                self._enqueuing.discard(tid)
+                self._in_flight[tid] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
+        self._enqueuing.discard(task_id)
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
@@ -77,8 +122,11 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+                try:
+                    self.enqueue(task, queue, priority=task.get("priority", 0))
+                    return True
+                except CapacityError:
+                    return False
         return False
 
 # 2019-04-25T08:37:12 update

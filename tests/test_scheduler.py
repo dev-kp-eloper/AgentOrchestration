@@ -36,6 +36,73 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_queue_capacity_bounds(self):
+        from src.orchestrator.scheduler import CapacityError
+        scheduler = TaskScheduler(default_max_queue_size=2)
+        scheduler.enqueue({"type": "task1"})
+        scheduler.enqueue({"type": "task2"})
+        with pytest.raises(CapacityError):
+            scheduler.enqueue({"type": "task3"})
+
+    def test_enqueue_rollback_releases_capacity(self):
+        from src.orchestrator.scheduler import CapacityError
+        scheduler = TaskScheduler(default_max_queue_size=2)
+        t1 = scheduler.enqueue({"type": "task1"})
+        t2 = scheduler.enqueue({"type": "task2"})
+        
+        # Queue is full now
+        with pytest.raises(CapacityError):
+            scheduler.enqueue({"type": "task3"})
+            
+        # Rollback one task
+        assert scheduler.enqueue_rollback(t2, queue="default")
+        
+        # Now we can enqueue again
+        t3 = scheduler.enqueue({"type": "task3"})
+        assert t3 is not None
+        assert scheduler.queue_size("default") == 2
+
+    def test_introspection_methods(self):
+        scheduler = TaskScheduler()
+        assert scheduler.queue_size() == 0
+        assert scheduler.in_flight_count() == 0
+        
+        t1 = scheduler.enqueue({"type": "task1"})
+        assert scheduler.queue_size() == 1
+        
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.queue_size() == 0
+        assert scheduler.in_flight_count() == 1
+        
+        scheduler.complete(t1)
+        assert scheduler.in_flight_count() == 0
+
+    def test_fail_under_capacity_limit(self):
+        from src.orchestrator.scheduler import CapacityError
+        scheduler = TaskScheduler(default_max_queue_size=1)
+        t1 = scheduler.enqueue({"type": "task1"})
+        
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.in_flight_count() == 1
+        assert scheduler.queue_size() == 0
+        
+        # Fill the queue while task is in flight
+        scheduler.enqueue({"type": "task2"})
+        assert scheduler.queue_size() == 1
+        
+        # Try to fail the first task, which tries to re-enqueue. Capacity is full.
+        # It should fail gracefully and return False instead of raising CapacityError
+        assert not scheduler.fail(task["id"])
+
+    def test_idempotent_rollback(self):
+        scheduler = TaskScheduler()
+        t1 = scheduler.enqueue({"type": "task1"})
+        assert scheduler.enqueue_rollback(t1) is True
+        assert scheduler.enqueue_rollback(t1) is False
+        assert scheduler.enqueue_rollback("non-existent-id") is False
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
