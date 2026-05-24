@@ -11,11 +11,63 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        # Declarative boundary: Machine and worker tokens are not allowed to perform destructive actions
+        self.machine_forbidden_methods = {"DELETE"}
+        self.worker_forbidden_methods = {"DELETE"}
+        # Simple registry of revoked token JTIs to invalidate stale/compromised credentials
+        self.revoked_tokens = set()
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header:
                 return Response(status_code=401, content="Unauthorized")
+            
+            # Consistently validate Bearer auth scheme case-insensitively
+            parts = auth_header.split(None, 1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
+                return Response(status_code=401, content="Unauthorized: Invalid authorization header format")
+                
+            token = parts[1]
+            if token.startswith("ao_machine_"):
+                token_type = "machine"
+            elif token.startswith("ao_user_"):
+                token_type = "user"
+            elif token.startswith("ao_worker_") or token.startswith("ao_browser_"):
+                token_type = "worker" if token.startswith("ao_worker_") else "browser"
+                token_parts = token.split("_")
+                if len(token_parts) < 5:  # ao, worker/browser, nbf, exp, jti
+                    return Response(status_code=401, content="Unauthorized: Invalid token format")
+                try:
+                    nbf = float(token_parts[2])
+                    exp = float(token_parts[3])
+                except ValueError:
+                    return Response(status_code=401, content="Unauthorized: Invalid token format")
+                
+                jti = "_".join(token_parts[4:])
+                
+                now = time.time()
+                # Check token not-before time
+                if now < nbf:
+                    return Response(status_code=401, content="Unauthorized: Token not active yet")
+                # Check token expiration time
+                if now > exp:
+                    return Response(status_code=401, content="Unauthorized: Token expired")
+                # Check revocation list
+                if jti in self.revoked_tokens:
+                    return Response(status_code=401, content="Unauthorized: Token revoked")
+            else:
+                return Response(status_code=403, content="Forbidden: Invalid token prefix")
+                
+            request.state.token_type = token_type
+            
+            if token_type == "machine" and request.method in self.machine_forbidden_methods:
+                return Response(status_code=403, content="Forbidden: Action not allowed for machine tokens")
+                
+            if token_type == "worker" and request.method in self.worker_forbidden_methods:
+                return Response(status_code=403, content="Forbidden: Action not allowed for worker tokens")
         return await call_next(request)
 
 
