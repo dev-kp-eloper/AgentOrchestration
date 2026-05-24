@@ -122,8 +122,58 @@ class TestAuthMiddleware:
         assert response.status_code == 403
         assert "Action not allowed for worker tokens" in response.text
 
-    def test_valid_browser_token_allowed(self):
-        now = time.time()
-        token = f"ao_browser_{now - 10}_{now + 10}_token123"
-        response = self.client.get("/api/v2/agents", headers={"Authorization": f"Bearer {token}"})
-        assert response.status_code == 200
+    def test_valid_browser_token_missing_origin_denied(self):
+        import os
+        os.environ["CORS_ORIGINS"] = "http://localhost:3000"
+        try:
+            now = time.time()
+            token = f"ao_browser_{now - 10}_{now + 10}_token123"
+            response = self.client.get("/api/v2/agents", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 400
+            assert "Missing Origin header for browser client" in response.text
+        finally:
+            del os.environ["CORS_ORIGINS"]
+
+    def test_valid_browser_token_invalid_origin_denied(self):
+        import os
+        os.environ["CORS_ORIGINS"] = "http://localhost:3000,https://app.example.com"
+        try:
+            now = time.time()
+            token = f"ao_browser_{now - 10}_{now + 10}_token123"
+            response = self.client.get("/api/v2/agents", headers={
+                "Authorization": f"Bearer {token}",
+                "Origin": "https://malicious.com"
+            })
+            assert response.status_code == 400
+            assert "Origin not in CORS allowlist" in response.text
+        finally:
+            del os.environ["CORS_ORIGINS"]
+
+    def test_valid_browser_token_wildcard_origin_denied(self):
+        import os
+        os.environ["CORS_ORIGINS"] = "*"
+        try:
+            now = time.time()
+            token = f"ao_browser_{now - 10}_{now + 10}_token123"
+            response = self.client.get("/api/v2/agents", headers={
+                "Authorization": f"Bearer {token}",
+                "Origin": "http://localhost:3000"
+            })
+            assert response.status_code == 400
+            assert "Origin not in CORS allowlist" in response.text
+        finally:
+            del os.environ["CORS_ORIGINS"]
+
+    def test_valid_browser_token_allowed_origin_success(self):
+        import os
+        os.environ["CORS_ORIGINS"] = "http://localhost:3000,https://app.example.com"
+        try:
+            now = time.time()
+            token = f"ao_browser_{now - 10}_{now + 10}_token123"
+            response = self.client.get("/api/v2/agents", headers={
+                "Authorization": f"Bearer {token}",
+                "Origin": "https://app.example.com"
+            })
+            assert response.status_code == 200
+        finally:
+            del os.environ["CORS_ORIGINS"]

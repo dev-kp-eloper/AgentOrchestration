@@ -20,55 +20,74 @@ class AuthMiddleware(BaseHTTPMiddleware):
         self.revoked_tokens = set()
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            auth_header = request.headers.get("Authorization", "")
-            if not auth_header:
-                return Response(status_code=401, content="Unauthorized")
-            
-            # Consistently validate Bearer auth scheme case-insensitively
-            parts = auth_header.split(None, 1)
-            if len(parts) != 2 or parts[0].lower() != "bearer":
-                return Response(status_code=401, content="Unauthorized: Invalid authorization header format")
+        has_state = False
+        try:
+            if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+                auth_header = request.headers.get("Authorization", "")
+                if not auth_header:
+                    return Response(status_code=401, content="Unauthorized")
                 
-            token = parts[1]
-            if token.startswith("ao_machine_"):
-                token_type = "machine"
-            elif token.startswith("ao_user_"):
-                token_type = "user"
-            elif token.startswith("ao_worker_") or token.startswith("ao_browser_"):
-                token_type = "worker" if token.startswith("ao_worker_") else "browser"
-                token_parts = token.split("_")
-                if len(token_parts) < 5:  # ao, worker/browser, nbf, exp, jti
-                    return Response(status_code=401, content="Unauthorized: Invalid token format")
-                try:
-                    nbf = float(token_parts[2])
-                    exp = float(token_parts[3])
-                except ValueError:
-                    return Response(status_code=401, content="Unauthorized: Invalid token format")
+                # Consistently validate Bearer auth scheme case-insensitively
+                parts = auth_header.split(None, 1)
+                if len(parts) != 2 or parts[0].lower() != "bearer":
+                    return Response(status_code=401, content="Unauthorized: Invalid authorization header format")
+                    
+                token = parts[1]
+                if token.startswith("ao_machine_"):
+                    token_type = "machine"
+                elif token.startswith("ao_user_"):
+                    token_type = "user"
+                elif token.startswith("ao_worker_") or token.startswith("ao_browser_"):
+                    token_type = "worker" if token.startswith("ao_worker_") else "browser"
+                    token_parts = token.split("_")
+                    if len(token_parts) < 5:  # ao, worker/browser, nbf, exp, jti
+                        return Response(status_code=401, content="Unauthorized: Invalid token format")
+                    try:
+                        nbf = float(token_parts[2])
+                        exp = float(token_parts[3])
+                    except ValueError:
+                        return Response(status_code=401, content="Unauthorized: Invalid token format")
+                    
+                    jti = "_".join(token_parts[4:])
+                    
+                    now = time.time()
+                    # Check token not-before time
+                    if now < nbf:
+                        return Response(status_code=401, content="Unauthorized: Token not active yet")
+                    # Check token expiration time
+                    if now > exp:
+                        return Response(status_code=401, content="Unauthorized: Token expired")
+                    # Check revocation list
+                    if jti in self.revoked_tokens:
+                        return Response(status_code=401, content="Unauthorized: Token revoked")
+                else:
+                    return Response(status_code=403, content="Forbidden: Invalid token prefix")
+                    
+                # Enforce CORS allowlist on credentialed requests — browser clients
+                if token_type == "browser":
+                    origin = request.headers.get("Origin")
+                    if not origin:
+                        return Response(status_code=400, content="Bad Request: Missing Origin header for browser client")
+                    
+                    import os
+                    cors_origins_env = os.getenv("CORS_ORIGINS", "")
+                    allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip() and o.strip() != "*"]
+                    
+                    if origin not in allowed_origins:
+                        return Response(status_code=400, content="Bad Request: Origin not in CORS allowlist")
                 
-                jti = "_".join(token_parts[4:])
+                request.state.token_type = token_type
+                has_state = True
                 
-                now = time.time()
-                # Check token not-before time
-                if now < nbf:
-                    return Response(status_code=401, content="Unauthorized: Token not active yet")
-                # Check token expiration time
-                if now > exp:
-                    return Response(status_code=401, content="Unauthorized: Token expired")
-                # Check revocation list
-                if jti in self.revoked_tokens:
-                    return Response(status_code=401, content="Unauthorized: Token revoked")
-            else:
-                return Response(status_code=403, content="Forbidden: Invalid token prefix")
-                
-            request.state.token_type = token_type
-            
-            if token_type == "machine" and request.method in self.machine_forbidden_methods:
-                return Response(status_code=403, content="Forbidden: Action not allowed for machine tokens")
-                
-            if token_type == "worker" and request.method in self.worker_forbidden_methods:
-                return Response(status_code=403, content="Forbidden: Action not allowed for worker tokens")
-        return await call_next(request)
+                if token_type == "machine" and request.method in self.machine_forbidden_methods:
+                    return Response(status_code=403, content="Forbidden: Action not allowed for machine tokens")
+                    
+                if token_type == "worker" and request.method in self.worker_forbidden_methods:
+                    return Response(status_code=403, content="Forbidden: Action not allowed for worker tokens")
+            return await call_next(request)
+        finally:
+            if has_state and hasattr(request.state, "token_type"):
+                delattr(request.state, "token_type")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
