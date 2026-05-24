@@ -1,13 +1,16 @@
-"""SDK decorators for agent definitions."""
-
 import functools
 import asyncio
+import inspect
+import logging
 from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
     def decorator(func: Callable) -> Callable:
+        is_async = inspect.iscoroutinefunction(func)
         func.__task_config__ = {
             "name": name or func.__name__,
             "retries": retries,
@@ -17,16 +20,42 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             try:
+                if is_async:
+                    coro = func(*args, **kwargs)
+                else:
+                    logger.debug(
+                        "Running sync task handler in thread executor",
+                        extra={"handler": func.__name__},
+                    )
+                    coro = asyncio.to_thread(func, *args, **kwargs)
+
                 result = await asyncio.wait_for(
-                    func(*args, **kwargs),
+                    coro,
                     timeout=timeout,
                 )
                 return result
             except asyncio.TimeoutError:
+                logger.error(
+                    "Task execution timed out",
+                    extra={"handler": func.__name__, "timeout": timeout},
+                )
                 raise TimeoutError(f"Task {name or func.__name__} timed out after {timeout}s")
+            except Exception:
+                logger.exception(
+                    "Task execution failed",
+                    extra={
+                        "handler": func.__name__,
+                        "handler_type": "async" if is_async else "sync",
+                    },
+                )
+                raise
+
+        wrapper._task_timeout = timeout
+        wrapper._task_async = is_async
 
         return wrapper
     return decorator
+
 
 
 def agent(name: str, version: str = "1.0.0", description: str = ""):
