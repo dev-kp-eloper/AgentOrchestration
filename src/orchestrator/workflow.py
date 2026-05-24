@@ -1,8 +1,16 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+
+class WorkflowCancelledError(RuntimeError):
+    """Raised when a workflow step is attempted on a cancelled parent workflow."""
+    pass
 
 
 class StepStatus(Enum):
@@ -11,10 +19,12 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300,
+                 parent_run_id: Optional[str] = None):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -23,6 +33,9 @@ class WorkflowStep:
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        # Optional reference to the parent run/workflow id for cancellation checks.
+        self.parent_run_id: Optional[str] = parent_run_id
+        self.attempt: int = 0
 
 
 class Workflow:
@@ -61,26 +74,99 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def cancel_workflow(self, workflow_id: str) -> bool:
+        """Cancel a workflow and propagate cancellation to all child steps.
+
+        Once cancelled, ``execute_workflow`` will refuse to start or retry
+        any step belonging to this workflow, preventing child retry after
+        parent cancel.
+
+        Returns True if the workflow was found and cancelled, False otherwise.
+        """
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+        if workflow.status == StepStatus.CANCELLED:
+            return True  # idempotent
+
+        workflow.status = StepStatus.CANCELLED
+        cancelled_steps = []
+        for step in workflow.steps:
+            if step.status not in (StepStatus.COMPLETED,):
+                step.status = StepStatus.CANCELLED
+                cancelled_steps.append(step.name)
+
+        logger.info(
+            "Workflow %r cancelled; propagated to %d child step(s): %s",
+            workflow_id, len(cancelled_steps), cancelled_steps,
+        )
+        return True
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
+        # Refuse to start if the parent workflow has already been cancelled.
+        if workflow.status == StepStatus.CANCELLED:
+            logger.warning(
+                "Refusing to execute cancelled workflow %r", workflow_id
+            )
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
+            # Re-check parent cancellation before every step and before every retry.
+            if workflow.status == StepStatus.CANCELLED:
+                step.status = StepStatus.CANCELLED
+                logger.info("Skipping step %r — parent workflow cancelled", step.name)
+                continue
+
             step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
+            step.attempt = 0
+            succeeded = False
+            last_exc: Optional[Exception] = None
+
+            for attempt in range(step.retries + 1):
+                # Guard: abort retry loop if parent was cancelled mid-flight.
+                if workflow.status == StepStatus.CANCELLED:
+                    step.status = StepStatus.CANCELLED
+                    logger.info(
+                        "Aborting retry for step %r (attempt %d) — parent cancelled",
+                        step.name, attempt,
+                    )
+                    break
+
+                step.attempt = attempt
+                try:
+                    step.result = step.handler()
+                    step.status = StepStatus.COMPLETED
+                    succeeded = True
+                    break
+                except WorkflowCancelledError:
+                    # Handler itself detected cancellation — propagate immediately.
+                    step.status = StepStatus.CANCELLED
+                    workflow.status = StepStatus.CANCELLED
+                    logger.info("Step %r raised WorkflowCancelledError; cancelling workflow", step.name)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "Step %r attempt %d failed: %s", step.name, attempt, exc
+                    )
+
+            if not succeeded and step.status not in (StepStatus.CANCELLED,):
+                step.error = str(last_exc)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
                 return False
 
-        workflow.status = StepStatus.COMPLETED
-        return True
+            if workflow.status == StepStatus.CANCELLED:
+                return False
+
+        if workflow.status != StepStatus.CANCELLED:
+            workflow.status = StepStatus.COMPLETED
+        return workflow.status == StepStatus.COMPLETED
 
 # 2019-03-27T19:58:07 update
 

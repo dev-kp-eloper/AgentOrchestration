@@ -2,7 +2,10 @@
 
 import os
 import tempfile
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 from typing import Dict, Optional
 from pathlib import Path
 
